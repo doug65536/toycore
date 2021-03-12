@@ -102,7 +102,7 @@ module test_fdiv;
 		a = 'h3f800000;
 		b = 'hffffface;
 		dispatch = 1;
-		expect = 'h3f800000;
+		expect = 'hffffface;
 		#10;
 		
 		dispatch = 0;
@@ -112,7 +112,7 @@ module test_fdiv;
 		a = 'hffffface;
 		b = 'h3f800000;
 		dispatch = 1;
-		expect = 'h3f800000;
+		expect = 'hffffface;
 		#10;
 		
 		dispatch = 0;
@@ -122,7 +122,7 @@ module test_fdiv;
 		a = 'hffffface;
 		b = 'hffffbeef;
 		dispatch = 1;
-		expect = 'h3f800000;
+		expect = 'hffffface;
 		#10;
 		
 		dispatch = 0;
@@ -152,7 +152,7 @@ module test_fdiv;
 		a = 'h00000000;
 		b = 'h00000000;
 		dispatch = 1;
-		expect = 'h3f800000;
+		expect = 'hff800000;
 		#10;
 		
 		dispatch = 0;
