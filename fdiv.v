@@ -1,8 +1,13 @@
+`default_nettype none
+`timescale 1ns/1ns
+
 module fdiv(
 	input wire clk,
+  input wire dispatch,
 	input wire [DATAW-1:0] a,
 	input wire [DATAW-1:0] b,
 	input wire [1:0] op,
+  output reg done,
 	output reg [DATAW-1:0] q
 );
 
@@ -91,77 +96,155 @@ localparam [DATAW-1:0] NEG_INF = {
 };
 
 reg [MANW-0:0] quotient;
-reg [DATAW-1:0] result;
 reg [EXPW+1:0] result_exp;
-reg result_sign;
+
+reg [7:0] div_cycles_remaining = 'b0;
+reg div_s;
+reg [MANW*2-0:0] div_n;
+reg [MANW*2-0:0] div_d;
+reg [MANW*2-0:0] div_q;
+reg [MANW*2-0:0] div_r;
+
+reg [MANW*2-0:0] div_next_n;
+reg [MANW*2-0:0] div_next_q;
+reg [MANW*2-0:0] div_next_r;
+
+reg div_result_bit;
+reg [MANW*2+1:0] div_next_r_minus_d;
+
+// Two extra bits, [MANW] detects overflow, [MANW+1] detects underflow
+reg [EXPW+1:0] div_e;
+
+reg early_sign;
+
+// Quick guess at result exponent before actual divide
+reg [EXPW+1:0] early_exponent;
 
 always @*
 begin
-  result_sign = a_sign ^ b_sign;
-
-  if (a_nan) begin
-    result <= a;
-  end else if (b_nan) begin
-    result <= b;
-  end else if (b_zero & a_zero) begin
-    // zero / zero = -nan
-    result = NAN;
-  end else if (b_zero) begin
-    // nonzero / zero = +/- infinity
-    result = (result_sign)
-      ? NEG_INF 
-      : POS_INF;
-  end else begin
-    quotient = ({a_fullman, {MANW{1'b0}}} / 
-      b_fullman);
-
-    if (|quotient) begin
-      result_exp = a_exponent - b_exponent + BIAS;
-      
-      // Normalize the mantissa
-      for (i = 0; i < MANW; i = i + 1) begin
-        if (~quotient[MANW]) begin
-          quotient = quotient << 1;
-          result_exp = result_exp - 'b1;
-        end
-      end
-
-      if (result_exp[EXPW]) begin
-        // It carried, infinite result
-        result = result_sign
-          ? POS_INF
-          : NEG_INF;
-      end else if (result_exp[EXPW+1]) begin
-        // It borrowed, zero result
-        result = result_sign
-          ? POS_ZERO
-          : NEG_ZERO;
-      end else begin
-        result = {
-          result_sign,
-          result_exp[EXPW-1:0],
-          quotient[MANW-1:0]
-        };
-      end
-    end else begin
-      // quotient is zero!
-      result_exp = 0;
-      result = 0;
-    end
-  end
+  early_sign = a_sign ^ b_sign;
+  early_exponent = a_exponent - b_exponent + BIAS;
 end
 
-localparam PIPELINE_LEN = 4;
-reg [DATAW-1:0] pipeline_div[0:PIPELINE_LEN];
+// Perform one iteration of divide algorithm
+always @*
+begin
+  // Rotate high bit of n into low bit of r
+  div_next_r = {div_r[DATAW-2:0], div_n[MANW*2]};
+  div_next_n = div_n << 1;
 
-integer i;
+  div_next_r_minus_d = {1'b0, div_next_r} - div_d;
+
+  // Result bit is 1 if the calculation above borrowed (wrapped)
+  div_result_bit = ~div_next_r_minus_d[MANW*2+1];
+
+  if (div_result_bit) begin
+    // Adjust remainder
+    div_next_r = div_next_r_minus_d;
+  end
+  
+  // Shift bit into result
+  div_next_q = {div_q[DATAW-2:0], div_result_bit};
+end
+
 always @(posedge clk)
 begin
-  pipeline_div[0] <= result;
-  for (i = 0; i < PIPELINE_LEN; i = i + 1) begin
-    pipeline_div[i+1] <= pipeline_div[i];
+  done <= 1'b0;
+
+  if (div_cycles_remaining == 1) begin
+    if (div_e[EXPW+1]) begin
+      // Underflowed to zero
+      q <= div_s
+        ? NEG_ZERO
+        : POS_ZERO;
+      done <= 1'b1;
+    end else if (div_e[EXPW]) begin
+      // Overflowed to infinity
+      q <= div_s
+        ? NEG_INF
+        : POS_INF;
+      done <= 1'b1;
+    end else if (~div_q[MANW]) begin
+      // Hidden bit of div_q is not set, the mantissa 
+      // needs to be shifted left by one, and the exponent 
+      // needs to be decreased by one, if not already zero
+      if (div_e == 0) begin
+        // Underflow to zero
+        q <= {
+          div_s,
+          {EXPW{1'b0}},
+          div_q[MANW-1:0]
+        };
+        done <= 1'b1;
+      end else begin
+        q <= {
+          div_s,
+          div_e - 1,
+          {div_q[MANW-2:1], 1'b0}
+        };
+        done <= 1'b1;
+      end
+    end else begin
+      // Mantissa is fine
+      q <= {
+        div_s,
+        div_e[EXPW-1:0],
+        div_q[MANW-1:0]
+      };
+      done <= 1'b1;
+    end
+
+    div_cycles_remaining <= 0;
+  end else if (div_cycles_remaining != 0) begin
+    // Step to next iteration
+    div_n <= div_next_n;
+    div_q <= div_next_q;
+    div_r <= div_next_r;
+    
+    div_cycles_remaining <= div_cycles_remaining - 1'b1;
+  end else if (dispatch) begin
+    // Handle all the trivial cases real quick
+    if (a_nan) begin
+      q <= a;
+      done <= 1'b1;
+    end else if (b_nan) begin
+      q <= b;
+      done <= 1'b1;
+    end else if (b_zero & a_zero) begin
+      // zero / zero = -nan
+      q = NAN;
+      done <= 1'b1;
+    end else if (b_zero) begin
+      // nonzero / zero = +/- infinity
+      q <= early_sign
+        ? NEG_INF 
+        : POS_INF;
+      done <= 1'b1;
+    end else if (early_exponent[EXPW+1]) begin
+      // Exponent will underflow
+      q <= early_sign
+        ? NEG_ZERO
+        : POS_ZERO;
+      done <= 1'b1;
+    end else if (early_exponent[EXPW] ||
+        &early_exponent[EXPW-1:0]) begin
+      // Exponent will overflow
+      q <= early_sign
+        ? NEG_INF
+        : POS_INF;
+      done <= 1'b1;
+    end else begin
+      // Gauntlet complete. Actually start a divide!
+      div_n <= {a_fullman, {MANW{1'b0}}};
+      div_d <= b_fullman;
+      div_q <= 0;
+      div_r <= 0;
+      div_cycles_remaining <= MANW * 2 + 2;
+
+      div_e <= early_exponent;
+      div_s <= early_sign;
+    end
   end
-  q <= pipeline_div[PIPELINE_LEN];
 end
 
 endmodule
