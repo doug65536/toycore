@@ -36,7 +36,7 @@ module test_fdiv;
 	wire done;
 
 	reg [31:0] expect = 0;
-	wire failed = expect != q;
+	wire failed = expect != q && done;
 
 	// Instantiate the Unit Under Test (UUT)
 	fdiv uut (
@@ -59,6 +59,7 @@ module test_fdiv;
 		// pi/e=3f93eee0
 		// e/pi=3f5d816a
 
+		// 1.0 / 1.0 = 1.0
 		a = 'h3f800000;
 		b = 'h3f800000;
 		dispatch = 1;
@@ -69,10 +70,23 @@ module test_fdiv;
 		while (~done)
 			#10;
 		
+		// 1.0 / 0.5 = 2.0
 		a = 'h3f800000;
 		b = 'h3f000000;
 		dispatch = 1;
 		expect = 'h40000000;
+		#10;
+		
+		dispatch = 0;
+		while (~done)
+			#10;
+		
+		// Needs mantissa normalized
+		// 1 / 1.99999988079 = 0.5
+		a = 'h3f800000;
+		b = 'h3fffffff;
+		dispatch = 1;
+		expect = 'h3f000001;
 		#10;
 		
 		dispatch = 0;
@@ -152,7 +166,7 @@ module test_fdiv;
 		a = 'h00000000;
 		b = 'h00000000;
 		dispatch = 1;
-		expect = 'hff800000;
+		expect = 'hffc00000;
 		#10;
 		
 		dispatch = 0;
@@ -165,7 +179,11 @@ module test_fdiv;
 		expect = 'h3f800000;
 		#10;
 		
+		dispatch = 0;
+		while (~done)
+			#10;
 		
+		$finish();
 	end
 
 	initial

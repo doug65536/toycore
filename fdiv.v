@@ -99,11 +99,14 @@ reg [MANW-0:0] quotient;
 reg [EXPW+1:0] result_exp;
 
 reg [7:0] div_cycles_remaining = 'b0;
-reg div_s;
-reg [MANW*2-0:0] div_n;
-reg [MANW*2-0:0] div_d;
-reg [MANW*2-0:0] div_q;
-reg [MANW*2-0:0] div_r;
+wire [5:0] div_cycles_remaining_decremented = 
+  div_cycles_remaining - 1'b1;
+
+reg div_sign;
+reg [MANW*2-0:0] div_numer;
+reg [MANW-0:0] div_denom;
+reg [MANW-0:0] div_quotient;
+reg [MANW*2-0:0] div_remainder;
 
 reg [MANW*2-0:0] div_next_n;
 reg [MANW*2-0:0] div_next_q;
@@ -113,7 +116,15 @@ reg div_result_bit;
 reg [MANW*2+1:0] div_next_r_minus_d;
 
 // Two extra bits, [MANW] detects overflow, [MANW+1] detects underflow
-reg [EXPW+1:0] div_e;
+reg [EXPW+1:0] div_exponent;
+wire [EXPW-1:0] decremented_exponent = div_exponent - 1'b1;
+
+wire div_round_up =
+  div_remainder >= div_denom[MANW-2:1];
+
+wire [MANW+1:0] rounded_quotient = div_quotient + div_round_up;
+wire [EXPW-1:0] rounded_exponent = div_exponent + rounded_quotient[MANW+1];
+wire rounded_infinity = &rounded_exponent;
 
 reg early_sign;
 
@@ -129,13 +140,13 @@ end
 // Perform one iteration of divide algorithm
 always @*
 begin
-  // Rotate high bit of n into low bit of r
-  div_next_r = {div_r[DATAW-2:0], div_n[MANW*2]};
-  div_next_n = div_n << 1;
+  // Rotate high bit of numerator into low bit of remainder
+  div_next_r = {div_remainder[MANW*2-1:0], div_numer[MANW*2]};
+  div_next_n = div_numer << 1;
 
-  div_next_r_minus_d = {1'b0, div_next_r} - div_d;
+  div_next_r_minus_d = {1'b0, div_next_r} - div_denom;
 
-  // Result bit is 1 if the calculation above borrowed (wrapped)
+  // Result bit is 1 if div_next_r >= div_denom
   div_result_bit = ~div_next_r_minus_d[MANW*2+1];
 
   if (div_result_bit) begin
@@ -144,7 +155,7 @@ begin
   end
   
   // Shift bit into result
-  div_next_q = {div_q[DATAW-2:0], div_result_bit};
+  div_next_q = {div_quotient[MANW-1:0], div_result_bit};
 end
 
 always @(posedge clk)
@@ -152,79 +163,73 @@ begin
   done <= 1'b0;
 
   if (div_cycles_remaining == 1) begin
-    if (div_e[EXPW+1]) begin
-      // Underflowed to zero
-      q <= div_s
-        ? NEG_ZERO
-        : POS_ZERO;
-      done <= 1'b1;
-    end else if (div_e[EXPW]) begin
-      // Overflowed to infinity
-      q <= div_s
-        ? NEG_INF
-        : POS_INF;
-      done <= 1'b1;
-    end else if (~div_q[MANW]) begin
-      // Hidden bit of div_q is not set, the mantissa 
+    // Perform final normalization
+    if (~div_quotient[MANW] && div_exponent != 0) begin
+      // Hidden bit of div_quotient is not set, the mantissa 
       // needs to be shifted left by one, and the exponent 
       // needs to be decreased by one, if not already zero
-      if (div_e == 0) begin
-        // Underflow to zero
-        q <= {
-          div_s,
-          {EXPW{1'b0}},
-          div_q[MANW-1:0]
-        };
-        done <= 1'b1;
-      end else begin
-        q <= {
-          div_s,
-          div_e - 1,
-          {div_q[MANW-2:1], 1'b0}
-        };
-        done <= 1'b1;
-      end
-    end else begin
+      // Shift in one bit to normalize
+      q <= {
+        div_sign,
+        decremented_exponent,
+        div_quotient[MANW-2:0], 
+        div_round_up
+      };
+
+      done <= 1'b1;
+    end else if (~rounded_infinity) begin
       // Mantissa is fine
       q <= {
-        div_s,
-        div_e[EXPW-1:0],
-        div_q[MANW-1:0]
+        div_sign,
+        rounded_exponent[EXPW-1:0],
+        rounded_quotient[MANW-1:0]
       };
+
+      done <= 1'b1;
+    end else begin
+      q <= div_sign
+        ? NEG_INF
+        : POS_INF;
+
       done <= 1'b1;
     end
 
-    div_cycles_remaining <= 0;
+    div_cycles_remaining <= div_cycles_remaining_decremented;
   end else if (div_cycles_remaining != 0) begin
     // Step to next iteration
-    div_n <= div_next_n;
-    div_q <= div_next_q;
-    div_r <= div_next_r;
+    div_numer <= div_next_n;
+    div_quotient <= div_next_q;
+    div_remainder <= div_next_r;
     
-    div_cycles_remaining <= div_cycles_remaining - 1'b1;
+    div_cycles_remaining <= div_cycles_remaining_decremented;
   end else if (dispatch) begin
     // Handle all the trivial cases real quick
     if (a_nan) begin
       q <= a;
+
       done <= 1'b1;
     end else if (b_nan) begin
       q <= b;
+
       done <= 1'b1;
     end else if (b_zero & a_zero) begin
       // zero / zero = -nan
       q = NAN;
+
       done <= 1'b1;
     end else if (b_zero) begin
       // nonzero / zero = +/- infinity
       q <= early_sign
         ? NEG_INF 
         : POS_INF;
+
       done <= 1'b1;
     end else if (early_exponent[EXPW+1]) begin
       // Exponent will underflow
       q <= early_sign
         ? NEG_ZERO
         : POS_ZERO;
+
       done <= 1'b1;
     end else if (early_exponent[EXPW] ||
         &early_exponent[EXPW-1:0]) begin
@@ -232,17 +237,27 @@ begin
       q <= early_sign
         ? NEG_INF
         : POS_INF;
+
+      done <= 1'b1;
+    end else if (b_zeroman) begin
+      // Super easy divide by power of two
+      q <= {
+        early_sign,
+        early_exponent[EXPW-1:0],
+        a_fullman[MANW-1:0]
+      };
+
       done <= 1'b1;
     end else begin
       // Gauntlet complete. Actually start a divide!
-      div_n <= {a_fullman, {MANW{1'b0}}};
-      div_d <= b_fullman;
-      div_q <= 0;
-      div_r <= 0;
-      div_cycles_remaining <= MANW * 2 + 2;
+      div_numer <= {a_fullman, {MANW{1'b0}}};
+      div_denom <= b_fullman;
+      div_quotient <= 0;
+      div_remainder <= 0;
+      div_exponent <= early_exponent;
+      div_sign <= early_sign;
 
-      div_e <= early_exponent;
-      div_s <= early_sign;
+      div_cycles_remaining <= MANW * 2 + 2;
     end
   end
 end
