@@ -114,10 +114,7 @@ assign irq = completion_pending | hotplug_pending;
 //         0 phase. command is valid if it matches consumer phase
 //           When the HC encounters an entry with the wrong phase, it stops
 //           until the next write to the cause/status register
-//  +4 31:25 Command CRC7
-//     15:0 Command CRC7
-//  +8  31:0 LBA (sd data address)
-// +12  31:0 Unused (available for driver)
+//  +4  31:0 LBA (sd data address)
  
 // SD command (48 bits)
 //        0 start bit is always zero
@@ -147,7 +144,7 @@ reg cmd_irq;
 reg cmd_rw;
 reg cmd_phase;
 reg [6:0] cmd_crc7;
-reg [15:0] cmd_crc16;
+reg [15:0] data_crc16[0:4-1];
 reg cmd_reading_lba;
 reg [31:0] cmd_lba;
 
@@ -256,6 +253,40 @@ begin
   end
 end
 
+localparam SDCMDCRCW = 7;
+reg cmd_crc_reset;
+reg cmd_crc_en;
+reg cmd_crc_data;
+wire [SDCMDCRCW-1:0] cmd_crc_out;
+
+crc7 cmd_crc(
+  .clk(clk),
+  .rst(cmd_crc_reset),
+  .en(cmd_crc_en),
+  .data(cmd_crc_data),
+  .crc(cmd_crc_out)
+);
+
+localparam SDDATAW = 4;
+
+// data crc, 4 parallel 1-bit crc16 instances
+reg [0:SDDATAW-1] data_crc_data;
+reg data_crc_en;
+reg data_crc_reset;
+
+generate
+genvar i;
+for (i = 0; i < 4; i = i + 1) begin
+  crc16 data_crc_n(
+    .clk(clk),
+    .rst(data_crc_reset),
+    .en(data_crc_en),
+    .data(data_crc_data[i]),
+    .crc(cmd_crc_out[i])
+  );
+end
+endgenerate
+
 // Initialization
 //  Initial clock frequency: 400kHz (100MHz divide by 250)
 
@@ -273,11 +304,187 @@ begin
 end
 
 // Command is sent serially on CMD line
+//  47 46 45:40 39:8 7:1 0
+//   |  |     |    |   | |
+//   |  |     |    |   | always 1 end bit
+//   |  |     |    |   crc7 
+//   |  |     |    arg
+//   |  |     command
+//   |  always 1 transmission bit
+//   always 0 start bit
+
+// The subset of that that actually contains data
+//   31:0 arg
+//  39:32 command
+localparam SDCMDSTATEW = 7;
+
+localparam SDCMDSTATE_CRCW = 7;
+
+localparam [SDCMDSTATEW-1:0] SDCMDSTATE_VARYINGW = 40;
+
+localparam [SDCMDSTATEW-1:0] SDCMDSTATE_IDLE = 0;
+
+localparam [SDCMDSTATEW-1:0] SDCMDSTATE_TXSTARTBIT = 
+  SDCMDSTATE_IDLE + 1;
+
+localparam [SDCMDSTATEW-1:0] SDCMDSTATE_TXDIRBIT = 
+  SDCMDSTATE_TXSTARTBIT + 1;
+
+localparam [SDCMDSTATEW-1:0] SDCMDSTATE_TXVARYING = 3;
+
+localparam [SDCMDSTATEW-1:0] SDCMDSTATE_TXCRC = 
+  SDCMDSTATE_TXVARYING + SDCMDSTATE_VARYINGW;
+
+localparam [SDCMDSTATEW-1:0] SDCMDSTATE_TXENDBIT = 
+  SDCMDSTATE_TXCRC + SDCMDSTATE_CRCW;
+
+localparam [SDCMDSTATEW-1:0] SDCMDSTATE_RXSTART = 
+  SDCMDSTATE_TXENDBIT + 1;
+
+localparam [SDCMDSTATEW-1:0] SDCMDSTATE_RXDIRBIT = 
+  SDCMDSTATE_RXSTART + 1;
+
+localparam [SDCMDSTATEW-1:0] SDCMDSTATE_RXVARYING = 
+  SDCMDSTATE_RXDIRBIT + 1;
+
+localparam [SDCMDSTATEW-1:0] SDCMDSTATE_RXCRC = 
+  SDCMDSTATE_RXVARYING + SDCMDSTATE_VARYINGW;
+
+localparam [SDCMDSTATEW-1:0] SDCMDSTATE_RXENDBIT = 
+  SDCMDSTATE_RXCRC + SDCMDSTATE_CRCW;
+
+localparam [SDCMDSTATEW-1:0] SDCMDSTATE_COMMIT = 
+  SDCMDSTATE_RXENDBIT + 1;
+
+localparam SDCMDBUFW = 40;
+
+reg sd_cmd_state = SDCMDSTATE_IDLE;
+reg [5:0] sd_cmd_bit;
+reg [SDCMDBUFW-1:0] sd_cmd_buf;
 
 always @(posedge clk)
 begin
   if (clk_cur == 0) begin
+    // Clean up the crc unless explicitly used below
+    cmd_crc_en <= 1'b0;
+    cmd_crc_reset <= 1'b0;
+    cmd_crc_data <= 1'b0;
+    
+    data_crc_en <= 1'b0;
+    data_crc_reset <= 1'b0;
+    data_crc_data <= 4'b0;
+
+    // Set up next delay
     clk_cur <= clk_div;
+
+    case (sd_cmd_state)
+    SDCMDSTATE_IDLE: begin
+    end
+
+    SDCMDSTATE_TXSTARTBIT: begin
+      sd_cmd_dir <= 1'b0;
+      sd_cmd_out <= 1'b0;
+
+      cmd_crc_en <= 1'b1;
+      cmd_crc_reset <= 1'b1;
+      cmd_crc_data <= 1'b0;
+      
+      sd_clk <= ~sd_clk;
+      sd_cmd_state <= cmd_state + 1'b1;
+    end
+
+    SDCMDSTATE_TXDIRBIT: begin
+      sd_cmd_dir <= 1'b0;
+      sd_cmd_out <= 1'b1;
+
+      cmd_crc_en <= 1'b1;
+      cmd_crc_data <= 1'b1;
+
+      sd_clk <= ~sd_clk;
+      sd_cmd_state <= cmd_state + 1'b1;
+    end
+
+    // Data transfer state handled in default: below
+
+    SDCMDSTATE_TXCRC: begin
+      // Send first CRC bit and also set up to use 
+      // default case to send the rest
+      sd_cmd_dir <= 1'b0;
+      sd_cmd_out <= cmd_crc_out[6];
+      sd_cmd_buf <= {cmd_crc_out[5:0], {40-6{1'b0}}};
+
+      cmd_crc_en <= 1'b1;
+      cmd_crc_data <= cmd_crc_out[6];
+
+      sd_clk <= ~sd_clk;
+      sd_cmd_state <= cmd_state + 1'b1;
+    end
+
+    // CRC transfer state handled in default: below
+
+    SDCMDSTATE_TXENDBIT: begin
+      sd_cmd_dir <= 1'b0;
+      sd_cmd_out <= 1'b1;
+
+      cmd_crc_en <= 1'b1;
+      cmd_crc_data <= 1'b1;
+
+      sd_clk = ~sd_clk;
+      sd_cmd_state <= sd_cmd_state + 1'b1;
+    end
+
+    SDCMDSTATE_RXSTART,
+    SDCMDSTATE_RXDIRBIT: begin
+      sd_cmd_dir <= 1'b1;
+      sd_cmd_buf <= (sd_cmd_buf << 1) | sd_cmd_in;
+
+      cmd_crc_en <= 1'b1;
+      cmd_crc_data <= 1'b1;
+      cmd_crc_reset <= 1'b1;
+      cmd_crc_data <= (sd_cmd_buf << 1) | sd_cmd_in;
+
+      sd_clk <= ~sd_clk;
+      sd_cmd_state <= sd_cmd_state + 1'b1;
+    end
+
+    SDCMDSTATE_RXENDBIT: begin
+      sd_cmd_dir <= 1'b1;
+
+      cmd_crc_en <= 1'b1;
+      cmd_crc_data <= sd_data_in;
+
+      sd_clk <= ~sd_clk;
+      sd_cmd_state <= SDCMDSTATE_IDLE;
+    end
+
+    default: begin
+      // Multi-bit states (keeps working until end of crc)
+      if (sd_cmd_state >= SDCMDSTATE_TXVARYING &&
+          sd_cmd_state < SDCMDSTATE_TXENDBIT) begin
+        sd_cmd_dir <= 1'b0;
+
+        sd_cmd_out <= sd_cmd_buf[SDCMDBUFW-1];
+        sd_cmd_buf <= sd_cmd_buf << 1;
+
+        cmd_crc_en <= 1'b1;
+        cmd_crc_data <= sd_cmd_buf[SDCMDBUFW-1];
+
+        sd_clk <= ~sd_clk;
+        sd_cmd_state <= sd_cmd_state + 1'b1;
+      end else if (sd_cmd_state >= SDCMDSTATE_RXVARYING &&
+        sd_cmd_state < SDCMDSTATE_RXENDBIT) begin
+        sd_cmd_dir <= 1'b1;
+        sd_cmd_buf <= {sd_cmd_in, sd_cmd_buf[SDCMDBUFW-2:1]};
+
+        cmd_crc_en <= 1'b1;
+        cmd_crc_data <= sd_cmd_in;
+
+        sd_clk <= ~sd_clk;
+        sd_cmd_state <= sd_cmd_state + 1'b1;
+      end
+    end
+
+    endcase
 
   end else begin
     clk_cur = clk_cur - 'b1;
