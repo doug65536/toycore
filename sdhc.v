@@ -365,43 +365,52 @@ reg [SDCMDBUFW-1:0] sd_cmd_buf;
 always @(posedge clk)
 begin
   if (clk_cur == 0) begin
-    // Clean up the crc unless explicitly used below
-    cmd_crc_en <= 1'b0;
-    cmd_crc_reset <= 1'b0;
-    cmd_crc_data <= 1'b0;
-    
-    data_crc_en <= 1'b0;
     data_crc_reset <= 1'b0;
     data_crc_data <= 4'b0;
 
     // Set up next delay
     clk_cur <= clk_div;
 
+    // Almost always toggle the sd clk
+    sd_clk <= ~sd_clk;
+
+    // Almost always advance state machine
+    sd_cmd_state <= sd_cmd_state + 1'b1;
+
+    // SD command direction is out unless specified otherwise
+    sd_cmd_dir <= 1'b0;
+
+    // SD data is 0 unless specified otherwise
+    sd_cmd_out <= 1'b0;
+
+    // Data is shifted into command CRC unless specified otherwise
+    cmd_crc_en <= 1'b1;
+
+    // Zero is shifted into command CRC unless specified otherwise
+    cmd_crc_data <= 1'b0;
+
+    // Command reset defaults off
+    cmd_crc_reset <= 1'b0;
+
     case (sd_cmd_state)
     SDCMDSTATE_IDLE: begin
+      // Don't toggle clk when idle
+      sd_clk <= sd_clk;
+
+      // Don't auto-advance state machine when idle
+      sd_cmd_state <= SDCMDSTATE_IDLE;
+
+      // Don't shift data into command CRC
+      cmd_crc_en <= 1'b0;
     end
 
     SDCMDSTATE_TXSTARTBIT: begin
-      sd_cmd_dir <= 1'b0;
-      sd_cmd_out <= 1'b0;
-
-      cmd_crc_en <= 1'b1;
       cmd_crc_reset <= 1'b1;
-      cmd_crc_data <= 1'b0;
-      
-      sd_clk <= ~sd_clk;
-      sd_cmd_state <= cmd_state + 1'b1;
     end
 
     SDCMDSTATE_TXDIRBIT: begin
-      sd_cmd_dir <= 1'b0;
       sd_cmd_out <= 1'b1;
-
-      cmd_crc_en <= 1'b1;
       cmd_crc_data <= 1'b1;
-
-      sd_clk <= ~sd_clk;
-      sd_cmd_state <= cmd_state + 1'b1;
     end
 
     // Data transfer state handled in default: below
@@ -409,28 +418,17 @@ begin
     SDCMDSTATE_TXCRC: begin
       // Send first CRC bit and also set up to use 
       // default case to send the rest
-      sd_cmd_dir <= 1'b0;
       sd_cmd_out <= cmd_crc_out[6];
-      sd_cmd_buf <= {cmd_crc_out[5:0], {40-6{1'b0}}};
-
-      cmd_crc_en <= 1'b1;
       cmd_crc_data <= cmd_crc_out[6];
 
-      sd_clk <= ~sd_clk;
-      sd_cmd_state <= cmd_state + 1'b1;
+      sd_cmd_buf <= {cmd_crc_out[5:0], {40-6{1'b0}}};
     end
 
     // CRC transfer state handled in default: below
 
     SDCMDSTATE_TXENDBIT: begin
-      sd_cmd_dir <= 1'b0;
       sd_cmd_out <= 1'b1;
-
-      cmd_crc_en <= 1'b1;
       cmd_crc_data <= 1'b1;
-
-      sd_clk = ~sd_clk;
-      sd_cmd_state <= sd_cmd_state + 1'b1;
     end
 
     SDCMDSTATE_RXSTART,
@@ -438,49 +436,32 @@ begin
       sd_cmd_dir <= 1'b1;
       sd_cmd_buf <= (sd_cmd_buf << 1) | sd_cmd_in;
 
-      cmd_crc_en <= 1'b1;
       cmd_crc_data <= 1'b1;
       cmd_crc_reset <= 1'b1;
       cmd_crc_data <= (sd_cmd_buf << 1) | sd_cmd_in;
-
-      sd_clk <= ~sd_clk;
-      sd_cmd_state <= sd_cmd_state + 1'b1;
     end
 
     SDCMDSTATE_RXENDBIT: begin
       sd_cmd_dir <= 1'b1;
 
-      cmd_crc_en <= 1'b1;
       cmd_crc_data <= sd_data_in;
-
-      sd_clk <= ~sd_clk;
-      sd_cmd_state <= SDCMDSTATE_IDLE;
     end
 
     default: begin
       // Multi-bit states (keeps working until end of crc)
       if (sd_cmd_state >= SDCMDSTATE_TXVARYING &&
           sd_cmd_state < SDCMDSTATE_TXENDBIT) begin
-        sd_cmd_dir <= 1'b0;
 
         sd_cmd_out <= sd_cmd_buf[SDCMDBUFW-1];
-        sd_cmd_buf <= sd_cmd_buf << 1;
-
-        cmd_crc_en <= 1'b1;
         cmd_crc_data <= sd_cmd_buf[SDCMDBUFW-1];
 
-        sd_clk <= ~sd_clk;
-        sd_cmd_state <= sd_cmd_state + 1'b1;
+        sd_cmd_buf <= sd_cmd_buf << 1;
       end else if (sd_cmd_state >= SDCMDSTATE_RXVARYING &&
         sd_cmd_state < SDCMDSTATE_RXENDBIT) begin
         sd_cmd_dir <= 1'b1;
         sd_cmd_buf <= {sd_cmd_in, sd_cmd_buf[SDCMDBUFW-2:1]};
 
-        cmd_crc_en <= 1'b1;
         cmd_crc_data <= sd_cmd_in;
-
-        sd_clk <= ~sd_clk;
-        sd_cmd_state <= sd_cmd_state + 1'b1;
       end
     end
 

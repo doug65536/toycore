@@ -26,7 +26,7 @@ module test_sdhc;
 
 // Inputs
 reg clk;
-reg [1:0] mmio_addr;
+reg [3:0] mmio_addr;
 reg mmio_req;
 reg mmio_read;
 reg [31:0] mmio_wr_data;
@@ -94,9 +94,21 @@ initial begin
 
 	// Wait 100 ns for global reset to finish
 	#100;
+
+	#10;
 			
 	// Add stimulus here
-	
+	mmio_wr_data = 32'b10000000;
+	mmio_addr = 0;
+	mmio_read = 0;
+	mmio_req = 1'b1;
+	#10;
+
+	mmio_addr = 0;
+	mmio_req = 0;
+	mmio_read = 0;
+	mmio_wr_data = 0;
+	#10;
 	
 end
 
