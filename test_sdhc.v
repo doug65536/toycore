@@ -37,6 +37,7 @@ reg [31:0] dma_rd_data;
 wire [31:0] mmio_rd_data;
 wire irq;
 wire dma_req;
+wire dma_read;
 wire [25:0] dma_addr;
 wire [31:0] dma_wr_data;
 wire sd_clk;
@@ -45,6 +46,8 @@ wire sd_clk;
 wire [3:0] sd_data;
 wire sd_cmd;
 
+// This testbench is the "device"
+// The device under test is the "host"
 reg sd_data_dir;
 reg sd_data_d2h;
 wire sd_data_h2d = sd_data_dir
@@ -75,12 +78,29 @@ sdhc uut (
 	.dma_req(dma_req), 
 	.dma_ack(dma_ack), 
 	.dma_addr(dma_addr), 
+	.dma_read(dma_read),
 	.dma_rd_data(dma_rd_data), 
 	.dma_wr_data(dma_wr_data), 
 	.sd_data(sd_data), 
 	.sd_cmd(sd_cmd), 
 	.sd_clk(sd_clk)
 );
+
+// 4KB of simulated memory to DMA
+reg [31:0] memory[0:2047];
+always @(posedge clk)
+begin
+	dma_ack <= 1'b0;
+	
+	if (dma_req) begin
+		if (dma_read)
+			dma_rd_data <= memory[dma_addr[12:2]];
+		else
+			memory[dma_addr[12:2]] <= dma_wr_data;
+		
+		dma_ack <= 1'b1;
+	end
+end
 
 initial begin
 	// Initialize Inputs
@@ -98,18 +118,70 @@ initial begin
 	#10;
 			
 	// Add stimulus here
+
+	// Reset
 	mmio_wr_data = 32'b10000000;
 	mmio_addr = 0;
 	mmio_read = 0;
 	mmio_req = 1'b1;
 	#10;
+	mmio_wr_data = 0;
 
+	// Poll until reset clears (should be practically immediately)
 	mmio_addr = 0;
 	mmio_req = 0;
-	mmio_read = 0;
-	mmio_wr_data = 0;
+	mmio_read = 1;
 	#10;
 	
+	// Wait
+	while (mmio_rd_data[31]) begin
+		#10;
+	end
+	
+	// Set ring address to 0x1000
+	mmio_addr = 8;
+	mmio_wr_data = 32'h1000;
+	mmio_req = 1;
+	mmio_read = 0;
+	#10;
+	mmio_req = 0;
+
+	// Stick some words in the request ring
+	memory[11'h400] = {
+		// cmd=1
+		1'b1,
+
+		// reserved 30:26
+		5'b0,
+
+		// command 0
+		22'd0,
+
+		// request completion interrupt
+		1'b1,
+
+		// no response
+		1'b0,
+
+		// phase=1
+		1'b1
+	};
+	#10;
+
+	memory[11'h401] = 0;
+	#10;
+
+	// doorbell
+	mmio_addr = 0;
+	mmio_wr_data = 32'h0;
+	mmio_req = 1;
+	mmio_read = 0;
+	#10;
+	mmio_req = 0;
+
+	while (~irq) begin
+		#10;
+	end
 end
 
 initial begin

@@ -5,7 +5,7 @@ module sdhc(
   input wire clk,
 
   // Register access from CPU
-  input wire [LOG2REGCOUNT-1:0] mmio_addr,
+  input wire [LOG2REGCOUNT+LOG2DATABYTES-1:0] mmio_addr,
   input wire mmio_req,
   input wire mmio_read,
   input wire [DATAW-1:0] mmio_wr_data,
@@ -14,10 +14,11 @@ module sdhc(
   // IRQ and DMA busses
   output wire irq,
   output reg dma_req,
+  output reg dma_read,
   input wire dma_ack,
   output reg [ADDRW-1:0] dma_addr,
   input wire [DATAW-1:0] dma_rd_data,
-  output wire [DATAW-1:0] dma_wr_data,
+  output reg [DATAW-1:0] dma_wr_data,
 
   // SD card interface  
   inout wire [3:0] sd_data,
@@ -26,6 +27,7 @@ module sdhc(
 );
 
 parameter LOG2DATAW = 5;
+localparam LOG2DATABYTES = LOG2DATAW - 3;
 localparam [LOG2DATAW:0] DATAW = 1 << LOG2DATAW;
 parameter ADDRW = 26;
 parameter LOG2PAGESZ = 12;
@@ -63,8 +65,8 @@ reg completion_unmasked = 1'b0;
 reg hotplug_unmasked = 1'b0;
 
 // Ring
-reg [PFNW-1:0] command_ring_pfn = {PFNW{1'b0}};
-reg [RINGINDEXW-1:0] command_ring_index = {RINGINDEXW{1'b0}};
+reg [PFNW-1:0] request_ring_pfn = {PFNW{1'b0}};
+reg [RINGINDEXW-1:0] request_ring_index = {RINGINDEXW{1'b0}};
 reg consumer_phase;
 
 // Pending interrupts
@@ -90,63 +92,91 @@ assign irq = completion_pending | hotplug_pending;
 //        1: (RW1C) card insertion/removal IRQ occurred
 //        0: (RW1C) command completed IRQ occurred
 //
-// +1: Interrupt enable
+// +4: Interrupt enable
 //       31: (RW) consumer phase. 
 //           Toggles automatically when the ring wraps
 //     30-2: reserved
 //        1: (RW) enable card insertion/removal irq
 //        0: (RW) enable command completed irq
 //
-// +2: Command ring physaddr
+// +8: Command ring physaddr
 //      4KB: aligned page containing 512 command and transfer descriptors
 //           writing this register resets the consumer to the start of the ring
 //    31:26: reserved
 //    25:12: 4KB page frame number of command ring
 //     11:0: reserved
 //
-// +3: Reserved
+// +c: Reserved
 //
-// Command ring entry
-//  +0 31:26 reserved
-//      25:4 physical memory address of data buffer (wiped on completion)
-//         2 irq 1=set completion interrupt pending on completion
-//         1 r/w 1=read 0=write (on completion, 1=success)
+// Pair of 32 bit words per request ring entry
+// Either a command or a data (LBA) transfer
+//
+// Both types, one data, one command
+//
+//  31  
+// +---+
+// |cmd|
+// +---+--------+-------+---+----+----+-----+
+// |   |30    26|35    4|  3|   2|   1|    0|
+// | 0 |reserved|address|irq|read|done|phase|
+// +---+--------+-------+---+----+----+-----+
+// |                    lba                 |
+// +---+--------+-------+---+----+----+-----+
+// |
+// +---+--------+-------+---+----+----+-----+
+// |   |30    12|11    4|  3|   2|   1|    0|
+// | 1 |reserved|command|irq|resp|done|phase|
+// +---+--------+-------+---+----+----+-----+
+// |                    arg                 |
+// +---+--------+-------+---+----+----+-----+
+//
+// Request ring entry
+//  +0    31 cmd 1=command 0=data
+//     30:26 reserved
+//      25:4 cmd=0 physical memory address of data buffer (wiped on completion)
+//     25:12 cmd=1 reserved
+//      11:4 cmd=1 command number
+//         3 irq 1=set completion interrupt pending on completion
+//         2 r/w cmd=0: 1=read 0=write (on completion, 1=success)
+//               cmd=1: 1=has response, 0=no response
+//         1 done 0=not done, 1=done
 //         0 phase. command is valid if it matches consumer phase
 //           When the HC encounters an entry with the wrong phase, it stops
 //           until the next write to the cause/status register
-//  +4  31:0 LBA (sd data address)
- 
+//  +4  31:0 cmd=1 command argument
+//      31:0 cmd=0 LBA (sd data address)
+
 // SD command (48 bits)
 //        0 start bit is always zero
-//        1 transmission bit always says H2D
+//        1 transmission bit: 1=host-to-device (request), 
+//                            0=device-to-host (reply)
 //  command 6-bit command
 //      arg 32-bit argument
 //      crc 7-bit crc
 //        1 end bit is always one
 
-localparam CMDSTATEW = 4;
-localparam [CMDSTATEW-1:0] CMDSTATE_OFFLINE = 0;
-localparam [CMDSTATEW-1:0] CMDSTATE_STARTING = 1;
-localparam [CMDSTATEW-1:0] CMDSTATE_IDLE = 2;
-localparam [CMDSTATEW-1:0] CMDSTATE_READCW1 = 3;
-localparam [CMDSTATEW-1:0] CMDSTATE_READCW2 = 4;
-localparam [CMDSTATEW-1:0] CMDSTATE_READCW3 = 5;
-localparam [CMDSTATEW-1:0] CMDSTATE_TXCMD = 6;
-localparam [CMDSTATEW-1:0] CMDSTATE_RXRES = 7;
-localparam [CMDSTATEW-1:0] CMDSTATE_TXDATA = 8;
-localparam [CMDSTATEW-1:0] CMDSTATE_RXDATA = 9;
-
-reg [CMDSTATEW-1:0] cmd_state = CMDSTATE_OFFLINE;
+// Request ring word bits
+localparam REQUEST_COMMAND_BIT = 31;
+localparam REQUEST_MEMADDR_W = 22;
+localparam REQUEST_MEMADDR_BIT = 4;
+localparam REQUEST_CMD_W = 8;
+localparam REQUEST_CMD_BIT = 4;
+localparam REQUEST_IRQ_BIT = 3;
+localparam REQUEST_RW_BIT = 2;
+localparam REQUEST_DONE_BIT = 1;
+localparam REQUEST_PHASE_BIT = 0;
 
 // Current command captured from command ring
-reg [ADDRW-4:0] cmd_phys_line_index;
-reg cmd_irq;
-reg cmd_rw;
-reg cmd_phase;
+reg [ADDRW-4:0] request_phys_line_index;
+reg request_irq;
+reg [ADDRW-4-1:0] request_payload_addr;
+reg request_rw;
+reg request_phase;
 reg [6:0] cmd_crc7;
 reg [15:0] data_crc16[0:4-1];
-reg cmd_reading_lba;
-reg [31:0] cmd_lba;
+reg request_cmd;
+reg [31:0] request_lba;
+reg cmd_pending;
 
 wire [DATAW-1:0] reg_cause_and_status_read = {
   general_failure,
@@ -166,18 +196,61 @@ wire [DATAW-1:0] reg_interrupt_enable = {
 
 wire [DATAW-1:0] reg_command_ring = {
   {DATAW-ADDRW{1'b0}},
-  command_ring_pfn,
+  request_ring_pfn,
   {LOG2PAGESZ{1'b0}}
 };
 
+localparam RINGSTATEW = 3;
+localparam [RINGSTATEW-1:0] RINGSTATE_IDLE = 0;
+
+// Read request word 1 (lots of fields)
+localparam [RINGSTATEW-1:0] RINGSTATE_READRW1 = 1;
+
+// Read request word 2 (command argument)
+localparam [RINGSTATEW-1:0] RINGSTATE_READRW2 = 2;
+
+// Wait for command idle
+localparam [RINGSTATEW-1:0] RINGSTATE_WAITIDLE = 3;
+
+// Wait for command reply
+localparam [RINGSTATEW-1:0] RINGSTATE_WAITCMD = 4;
+
+// Transfer data
+localparam [RINGSTATEW-1:0] RINGSTATE_XFERDAT = 5;
+
+// Write result back into to request ring with DMA
+localparam [RINGSTATEW-1:0] RINGSTATE_WRITRES = 6;
+
+localparam SDCMD_RDSINGLE = 8'd18;
+localparam SDCMD_WRSINGLE = 8'd24;
+
+reg [RINGSTATEW-1:0] ring_state;
+
+localparam BLOCKWORDIDXW = 7;
+reg [BLOCKWORDIDXW-1:0] request_word_index;
+
 always @(posedge clk)
 begin
+  // Usually don't care MMIO read data
   mmio_rd_data <= 32'bx;
+
+  // Usually access the ring
+  dma_addr <= {
+    request_ring_pfn, 
+    request_ring_index, 
+    3'h0
+  };
+
+  // Usually DMA read
+  dma_read <= 1'b1;
+
+  // Usually don't request DMA
   dma_req <= 1'b0;
-  dma_addr <= {ADDRW{1'bx}};
 
   if (mmio_req) begin
-    case (mmio_addr[3:2])
+    // MMIO supersedes everything
+
+    case (mmio_addr[LOG2DATABYTES+LOG2REGCOUNT-1:LOG2DATABYTES])
     2'b00: begin
       //
       // Command register
@@ -201,14 +274,37 @@ begin
           // Reset
           resetting <= 1'b1;
           ready <= 1'b0;
+          cmd_pending <= 1'b0;
+          
+          // Clear error conditions
           general_failure <= 1'b0;
           card_initialized <= 1'b0;
+          
+          // Clear IRQ unmasks
           completion_unmasked <= 1'b0;
           hotplug_unmasked <= 1'b0;
-          command_ring_pfn <= {PFNW{1'b0}};
-          command_ring_index <= {RINGINDEXW{1'b0}};
-          consumer_phase <= 1'b0;
-          cmd_state <= CMDSTATE_OFFLINE;
+
+          // Ring state
+          request_ring_pfn <= {PFNW{1'b0}};
+          request_ring_index <= {RINGINDEXW{1'b0}};          
+          consumer_phase <= 1'b1;
+          
+          // Ring entry
+          request_lba <= 32'b0;
+          request_phase <= 1'b0;
+          request_rw <= 1'b0;
+          request_irq <= 1'b0;
+          request_phys_line_index <= 0;
+          
+          // Reset CRCs
+          cmd_crc_reset <= 1'b1;
+          data_crc_reset <= 1'b1;
+
+          // Go IDLE
+          sd_cmd_state <= SDCMDSTATE_IDLE;
+        end else if (ring_state == RINGSTATE_IDLE) begin
+          // Doorbell access that does not reset wakes up ring
+          ring_state <= RINGSTATE_READRW1;
         end
       end
     end
@@ -235,21 +331,119 @@ begin
       if (mmio_read) begin
         mmio_rd_data <= reg_command_ring;
       end else begin
-        command_ring_pfn <= mmio_wr_data[ADDRW-1:LOG2PAGESZ];
-        command_ring_index <= {RINGINDEXW{1'b0}};
+        request_ring_pfn <= mmio_wr_data[ADDRW-1:LOG2PAGESZ];
+        request_ring_index <= {RINGINDEXW{1'b0}};
       end
     end
     
     2'b11: begin
+      // Reserved
+      mmio_rd_data <= {DATAW{1'b0}};
     end
 
     endcase
   end else if (resetting) begin
-    // Initialize SD interface
-    
+    // Reset is priority 2
+    resetting <= 1'b0;
+    ready <= 1'b1;
+    ring_running <= 1'b1;
+    ring_state <= RINGSTATE_IDLE;
   end else if (ready) begin
+    // Ring is priority 3
     // Operating normally
+    if (ring_running) begin
+      case (ring_state)
+      RINGSTATE_IDLE: begin
+      end
 
+      RINGSTATE_READRW1: begin
+        if (dma_req & dma_ack) begin
+          // Capture address of buffer
+          request_payload_addr <= {
+            dma_rd_data[
+              REQUEST_MEMADDR_BIT+REQUEST_MEMADDR_W-1:
+              REQUEST_MEMADDR_BIT],
+            {REQUEST_MEMADDR_BIT{1'b0}}
+          };
+          request_cmd <= dma_rd_data[REQUEST_COMMAND_BIT];
+          request_irq = dma_rd_data[REQUEST_IRQ_BIT];
+          request_rw = dma_rd_data[REQUEST_RW_BIT];
+          request_phase = dma_rd_data[REQUEST_PHASE_BIT];
+          
+          ring_state <= ring_state + 1'b1;
+        end else begin
+          dma_req <= 1'b1;
+        end
+      end
+
+      RINGSTATE_READRW2: begin
+        if (request_phase != consumer_phase) begin
+          // If the command has the wrong phase, 
+          // stop reading the ring until next doorbell
+          ring_state <= RINGSTATE_IDLE;
+        end else if (dma_req && dma_ack) begin
+          request_lba <= dma_rd_data;
+
+          request_word_index <= {BLOCKWORDIDXW{1'b0}};
+
+          if (request_cmd) begin
+            // Assemble arbitrary command from
+            // request address field and LBA field
+            sd_cmd_buf <= {
+              request_payload_addr[7:0],
+
+              // Second request word from data bus
+              dma_rd_data
+            };
+          end else begin
+            // Select read or write LBA command
+            sd_cmd_buf <= {
+              (request_rw
+              ? SDCMD_RDSINGLE
+              : SDCMD_WRSINGLE),
+              
+              // Second request word from data bus
+              dma_rd_data
+            };
+          end
+          
+          ring_state <= ring_state + 1'b1;
+        end else begin
+          // Keep requesting DMA until complete
+          dma_addr <= {
+            request_ring_pfn, 
+            request_ring_index, 
+            3'h4
+          };
+          dma_req <= 1'b1;
+        end
+      end
+
+      RINGSTATE_WAITIDLE: begin
+        // When possible to begin sending command, start that,
+        // and go to next ring state
+        if (sd_cmd_state == SDCMDSTATE_IDLE) begin
+          cmd_pending <= 1'b1;
+          ring_state <= RINGSTATE_WAITCMD;
+        end
+      end
+
+      RINGSTATE_WAITCMD: begin
+        if (sd_cmd_state == SDCMDSTATE_IDLE) begin
+          ring_state <= ring_state + 1'b1;
+        end
+      end
+
+      RINGSTATE_XFERDAT: begin
+        ring_state <= ring_state + 1'b1;
+      end
+
+      RINGSTATE_WRITRES: begin
+        ring_state <= ring_state + 1'b1;
+      end
+
+      endcase
+    end
   end
 end
 
@@ -257,6 +451,7 @@ localparam SDCMDCRCW = 7;
 reg cmd_crc_reset;
 reg cmd_crc_en;
 reg cmd_crc_data;
+reg cmd_framing_error;
 wire [SDCMDCRCW-1:0] cmd_crc_out;
 
 crc7 cmd_crc(
@@ -270,9 +465,11 @@ crc7 cmd_crc(
 localparam SDDATAW = 4;
 
 // data crc, 4 parallel 1-bit crc16 instances
-reg [0:SDDATAW-1] data_crc_data;
+reg [SDDATAW-1:0] data_crc_data;
 reg data_crc_en;
 reg data_crc_reset;
+
+wire [15:0] data_crc_out[0:3];
 
 generate
 genvar i;
@@ -282,7 +479,7 @@ for (i = 0; i < 4; i = i + 1) begin
     .rst(data_crc_reset),
     .en(data_crc_en),
     .data(data_crc_data[i]),
-    .crc(cmd_crc_out[i])
+    .crc(data_crc_out[i])
   );
 end
 endgenerate
@@ -358,39 +555,51 @@ localparam [SDCMDSTATEW-1:0] SDCMDSTATE_COMMIT =
 
 localparam SDCMDBUFW = 40;
 
-reg sd_cmd_state = SDCMDSTATE_IDLE;
+reg sd_cmd_state;
 reg [5:0] sd_cmd_bit;
 reg [SDCMDBUFW-1:0] sd_cmd_buf;
 
 always @(posedge clk)
 begin
-  if (clk_cur == 0) begin
-    data_crc_reset <= 1'b0;
-    data_crc_data <= 4'b0;
+  cmd_crc_reset <= 1'b0;
+  data_crc_reset <= 1'b0;
+  data_crc_data <= 4'b0;
 
+  // Data not shifted shifted when waiting for clocks
+  cmd_crc_en <= 1'b0;
+  data_crc_en <= 1'b0;
+
+  // Zero is shifted into command CRC unless specified otherwise
+  cmd_crc_data <= 1'b0;
+
+  // Command crc reset defaults off
+  cmd_crc_reset <= 1'b0;
+
+  // Data crc reset defaults off
+  data_crc_reset <= 1'b0;
+
+  if (clk_cur == 0) begin
     // Set up next delay
     clk_cur <= clk_div;
 
     // Almost always toggle the sd clk
     sd_clk <= ~sd_clk;
+  end
 
+  // Update outputs if clock edge
+  // Update outputs with no wait for clock if idle
+  if (clk_cur == 0 || sd_cmd_state == SDCMDSTATE_IDLE) begin
     // Almost always advance state machine
     sd_cmd_state <= sd_cmd_state + 1'b1;
 
     // SD command direction is out unless specified otherwise
     sd_cmd_dir <= 1'b0;
 
-    // SD data is 0 unless specified otherwise
+    // SD command output is 0 unless specified otherwise
     sd_cmd_out <= 1'b0;
-
+  
     // Data is shifted into command CRC unless specified otherwise
     cmd_crc_en <= 1'b1;
-
-    // Zero is shifted into command CRC unless specified otherwise
-    cmd_crc_data <= 1'b0;
-
-    // Command reset defaults off
-    cmd_crc_reset <= 1'b0;
 
     case (sd_cmd_state)
     SDCMDSTATE_IDLE: begin
@@ -398,7 +607,11 @@ begin
       sd_clk <= sd_clk;
 
       // Don't auto-advance state machine when idle
-      sd_cmd_state <= SDCMDSTATE_IDLE;
+      if (cmd_pending) begin
+        cmd_pending <= 1'b0;
+      end else begin
+        sd_cmd_state <= SDCMDSTATE_IDLE;
+      end
 
       // Don't shift data into command CRC
       cmd_crc_en <= 1'b0;
@@ -416,51 +629,65 @@ begin
     // Data transfer state handled in default: below
 
     SDCMDSTATE_TXCRC: begin
-      // Send first CRC bit and also set up to use 
-      // default case to send the rest
+      // Send first CRC bit
       sd_cmd_out <= cmd_crc_out[6];
       cmd_crc_data <= cmd_crc_out[6];
 
+      // Put rest of crc into MSB of buffer and let them shift out
+      // let the default case shift them out
       sd_cmd_buf <= {cmd_crc_out[5:0], {40-6{1'b0}}};
     end
 
     // CRC transfer state handled in default: below
 
     SDCMDSTATE_TXENDBIT: begin
+      // End bit is always 1
       sd_cmd_out <= 1'b1;
       cmd_crc_data <= 1'b1;
+
+      // Clear framing error before first one can occur
+      cmd_framing_error <= 1'b0;
     end
 
     SDCMDSTATE_RXSTART,
     SDCMDSTATE_RXDIRBIT: begin
       sd_cmd_dir <= 1'b1;
-      sd_cmd_buf <= (sd_cmd_buf << 1) | sd_cmd_in;
 
-      cmd_crc_data <= 1'b1;
+      // Expect zero bit for both start and dir
+      cmd_framing_error <= cmd_framing_error | sd_cmd_in;
       cmd_crc_reset <= 1'b1;
-      cmd_crc_data <= (sd_cmd_buf << 1) | sd_cmd_in;
+      cmd_crc_data <= sd_cmd_in;
     end
 
     SDCMDSTATE_RXENDBIT: begin
       sd_cmd_dir <= 1'b1;
 
-      cmd_crc_data <= sd_data_in;
+      cmd_crc_en <= 1'b0;
+
+      // Flag error if end bit is not 1
+      cmd_framing_error <= cmd_framing_error | ~sd_data_in;
+
+      // Done!
+      sd_cmd_state <= SDCMDSTATE_IDLE;
     end
 
     default: begin
       // Multi-bit states (keeps working until end of crc)
       if (sd_cmd_state >= SDCMDSTATE_TXVARYING &&
           sd_cmd_state < SDCMDSTATE_TXENDBIT) begin
-
+        // Send a bit
         sd_cmd_out <= sd_cmd_buf[SDCMDBUFW-1];
         cmd_crc_data <= sd_cmd_buf[SDCMDBUFW-1];
 
+        // Put next bit in MSB
         sd_cmd_buf <= sd_cmd_buf << 1;
       end else if (sd_cmd_state >= SDCMDSTATE_RXVARYING &&
-        sd_cmd_state < SDCMDSTATE_RXENDBIT) begin
+          sd_cmd_state < SDCMDSTATE_RXENDBIT) begin
+        // Receive a bit
         sd_cmd_dir <= 1'b1;
-        sd_cmd_buf <= {sd_cmd_in, sd_cmd_buf[SDCMDBUFW-2:1]};
-
+        
+        // Rotate incoming bit into LSB
+        sd_cmd_buf <= {sd_cmd_buf[SDCMDBUFW-2:0], sd_cmd_in};
         cmd_crc_data <= sd_cmd_in;
       end
     end
